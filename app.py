@@ -1,48 +1,113 @@
 from flask import Flask, render_template, request, jsonify, send_file
-import cv2
 import pandas as pd
 from datetime import datetime
 import os
-import numpy as np
 import base64
 import io
 from PIL import Image
+import numpy as np
+import hashlib
 
 app = Flask(__name__)
 
 # Directory containing known face images
 known_faces_dir = 'images'
 
-# Load known faces using OpenCV
-known_faces = []
+# Store known face features for lightweight comparison
+known_face_features = {}
 known_names = []
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Load known faces
+# Load known faces using PIL with feature extraction
 def load_known_faces():
-    global known_faces, known_names
-    known_faces = []
+    global known_face_features, known_names
+    known_face_features = {}
     known_names = []
     
     # Load actual face images from the images directory
     for filename in os.listdir(known_faces_dir):
         if filename.endswith(('.jpg', '.png', '.jpeg')):
             image_path = os.path.join(known_faces_dir, filename)
-            image = cv2.imread(image_path)
-            if image is not None:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-                if len(faces) > 0:
-                    x, y, w, h = faces[0]
-                    face_roi = gray[y:y+h, x:x+w]
-                    face_roi = cv2.resize(face_roi, (100, 100))
-                    known_faces.append(face_roi)
-                    known_names.append(filename.split('.')[0])
-                    print(f"Loaded face: {filename.split('.')[0]}")
+            try:
+                image = Image.open(image_path)
+                # Convert to grayscale and resize for consistent feature extraction
+                image = image.convert('L').resize((100, 100))
+                
+                # Extract features using a simple but effective method
+                features = extract_features(image)
+                
+                known_face_features[filename.split('.')[0]] = features
+                known_names.append(filename.split('.')[0])
+                print(f"Loaded face: {filename.split('.')[0]}")
+            except Exception as e:
+                print(f"Error loading {filename}: {e}")
     
-    print(f"Loaded {len(known_faces)} known faces: {known_names}")
+    print(f"Loaded {len(known_names)} known faces: {known_names}")
 
-# Function to recognize face using template matching
+def extract_features(image):
+    """Extract features from image using a lightweight approach"""
+    # Convert to numpy array
+    img_array = np.array(image, dtype=np.float32)
+    
+    # Apply simple blur using convolution
+    kernel = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]]) / 9.0
+    img_blur = np.zeros_like(img_array)
+    
+    # Simple convolution for blurring
+    for i in range(1, img_array.shape[0] - 1):
+        for j in range(1, img_array.shape[1] - 1):
+            img_blur[i, j] = np.sum(img_array[i-1:i+2, j-1:j+2] * kernel)
+    
+    # Extract features using gradient and intensity information
+    features = []
+    
+    # Divide image into 10x10 blocks and extract features from each
+    block_size = 10
+    for i in range(0, 100, block_size):
+        for j in range(0, 100, block_size):
+            block = img_blur[i:i+block_size, j:j+block_size]
+            
+            # Calculate mean intensity
+            mean_intensity = np.mean(block)
+            
+            # Calculate gradient magnitude (simplified and fixed)
+            if block.shape[0] > 1 and block.shape[1] > 1:
+                grad_x = np.diff(block, axis=1)
+                grad_y = np.diff(block, axis=0)
+                # Ensure both gradients have the same shape
+                min_rows = min(grad_x.shape[0], grad_y.shape[0])
+                min_cols = min(grad_x.shape[1], grad_y.shape[1])
+                if min_rows > 0 and min_cols > 0:
+                    gradient_magnitude = np.sqrt(grad_x[:min_rows, :min_cols]**2 + grad_y[:min_rows, :min_cols]**2)
+                    mean_gradient = np.mean(gradient_magnitude)
+                else:
+                    mean_gradient = 0
+            else:
+                mean_gradient = 0
+            
+            # Calculate standard deviation
+            std_intensity = np.std(block)
+            
+            # Calculate histogram features
+            hist, _ = np.histogram(block, bins=8, range=(0, 255))
+            hist = hist / (np.sum(hist) + 1e-8)  # Normalize with small epsilon
+            
+            features.extend([mean_intensity, mean_gradient, std_intensity])
+            features.extend(hist)
+    
+    # Normalize features
+    features = np.array(features)
+    features = (features - np.mean(features)) / (np.std(features) + 1e-8)
+    
+    return features
+
+def cosine_similarity(a, b):
+    """Calculate cosine similarity between two vectors"""
+    dot_product = np.dot(a, b)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    return dot_product / (norm_a * norm_b + 1e-8)
+
+# Function to recognize face using feature comparison
 def recognize_face(image_data):
     try:
         # Decode base64 image
@@ -50,34 +115,26 @@ def recognize_face(image_data):
         image_bytes = base64.b64decode(image_data)
         image = Image.open(io.BytesIO(image_bytes))
         
-        # Convert PIL image to OpenCV format
-        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+        # Convert to grayscale and resize for consistent feature extraction
+        image = image.convert('L').resize((100, 100))
         
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+        # Extract features from the uploaded image
+        uploaded_features = extract_features(image)
         
-        if len(faces) == 0:
-            return None, "No faces detected in the image."
-        
-        # Get the first detected face
-        x, y, w, h = faces[0]
-        face_roi = gray[y:y+h, x:x+w]
-        face_roi = cv2.resize(face_roi, (100, 100))
-        
-        # Compare with known faces using template matching
+        # Compare with known faces
         best_match = None
-        best_score = 0
+        best_similarity = 0
         
-        for i, known_face in enumerate(known_faces):
-            result = cv2.matchTemplate(face_roi, known_face, cv2.TM_CCOEFF_NORMED)
-            score = np.max(result)
+        for name, known_features in known_face_features.items():
+            # Calculate cosine similarity (higher is better)
+            similarity = cosine_similarity(uploaded_features, known_features)
             
-            if score > best_score and score > 0.5:  # Threshold for matching
-                best_score = score
-                best_match = known_names[i]
+            if similarity > best_similarity and similarity > 0.6:  # 60% similarity threshold
+                best_similarity = similarity
+                best_match = name
         
         if best_match:
-            return best_match, f"Recognized as {best_match} (confidence: {best_score:.2f})"
+            return best_match, f"Recognized as {best_match} (similarity: {best_similarity:.2f})"
         else:
             return None, "Face not recognized. Please try again."
             
